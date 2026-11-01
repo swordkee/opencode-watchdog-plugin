@@ -21,8 +21,10 @@ const STALE_OVERRIDES = { "e:/work/bmall": 90 * 60 * 1000 }
 const NUDGE_MS = 15 * 60 * 1000
 const DRIFT_EVERY_MS = 60 * 60 * 1000
 const DRIFT_MIN_RUN_MS = 30 * 60 * 1000
+const REVIVE_CAP = 2 // auto-revive budget per session per run window
 const fs = require("fs")
 const path = require("path")
+const { spawn } = require("child_process")
 
 const LOG_DIR = path.join(
   process.env.USERPROFILE || process.env.HOME || ".",
@@ -42,6 +44,24 @@ function log(...a) {
 
 function norm(p) {
   return (p || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()
+}
+
+// Never hardcode the CLI path (Scoop upgrades move it). The server process IS
+// the opencode binary, so process.execPath re-runs it; then Bun.which; then
+// plain PATH lookup as last resort.
+function resolveOpencode() {
+  if (process.env.OPENCODE_EXECUTABLE) return process.env.OPENCODE_EXECUTABLE
+  try {
+    if (/(^|[\\/])opencode(\.exe)?$/i.test(process.execPath || ""))
+      return process.execPath
+  } catch {}
+  try {
+    if (typeof Bun !== "undefined" && Bun.which) {
+      const p = Bun.which("opencode")
+      if (p) return p
+    }
+  } catch {}
+  return "opencode"
 }
 
 function owns(myDir, sessionDir) {
@@ -74,11 +94,40 @@ export default {
     const running = new Map()
     const pendingPermission = new Map() // sessionID -> askedAt
     const toolHistory = new Map() // sessionID -> [inputHash,...]
+    const reviveCount = new Map() // sessionID -> auto-revives this run window
 
     const send = (sessionID, text, delivery) =>
       ctx.session
         .prompt({ sessionID, text, delivery: delivery || "steer", resume: false })
         .catch((e) => log("steer failed:", sessionID, String(e)))
+
+    // Interrupt alone leaves an idle session with queued notes nobody reads
+    // (prompts never wake an idle session). Drive it with the documented
+    // revive flow so it reports and can continue. Capped per run window.
+    const autoRevive = (id, staleMin) => {
+      try {
+        const n = reviveCount.get(id) || 0
+        if (n >= REVIVE_CAP) {
+          log("revive skipped (cap reached):", id)
+          return
+        }
+        reviveCount.set(id, n + 1)
+        const oc = resolveOpencode()
+        const out = fs.openSync(path.join(LOG_DIR, "revive-" + id + ".log"), "a")
+        const p = spawn(
+          oc,
+          [
+            "run", "-s", id, "--continue", "--agent", "build", "--auto",
+            "你因 ≥" + staleMin + " 分钟无活动被看门狗自动打断。请立即向用户汇报当前进度、已完成项与卡点（先不要做新的写操作），等待下一步指令。",
+          ],
+          { detached: true, stdio: ["ignore", out, out], windowsHide: true }
+        )
+        p.unref()
+        log("auto-revive spawned:", id, "n=" + (n + 1))
+      } catch (e) {
+        log("auto-revive failed:", id, String(e))
+      }
+    }
 
     // --- backfill (owned + no outcome + updated within 1h) ---
     try {
@@ -135,6 +184,7 @@ export default {
               lastDriftAt: 0,
             })
             toolHistory.set(id, [])
+            reviveCount.set(id, 0)
           } else if (
             event.type === "session.execution.succeeded" ||
             event.type === "session.execution.failed" ||
@@ -265,14 +315,27 @@ export default {
         for (const [id, e] of [...running.entries()]) {
           const s = infos.get(id)
           if (!s) continue
-          if (busyParents.has(id)) {
-            e.lastSeen = now // lead waiting on running subagents
-            continue
-          }
-
           const dbUpdated = s.time && s.time.updated ? Number(s.time.updated) : 0
           const last = Math.max(e.lastSeen || 0, dbUpdated)
           const idleMin = last ? Math.round((now - last) / 60000) : -1
+
+          // workers (child sessions) are supervised by their main session:
+          // no nudge, no interrupt here — prevents retry storms (W-5 x5)
+          if (s.parentID) continue
+
+          // busy parent = waiting on running subagents: courtesy nudge at 2x
+          // window, never interrupt
+          if (busyParents.has(id)) {
+            if (!e.nudged && idleMin >= (NUDGE_MS * 2) / 60000) {
+              e.nudged = true
+              log("busy-parent nudge:", id, idleMin + "m")
+              send(
+                id,
+                "[watchdog ping] 你的子任务仍在运行；若在等待请忽略；若子任务已卡死，请介入处理。"
+              )
+            }
+            continue
+          }
 
           // gate: waiting on a human permission card — not stuck
           const askedAt = pendingPermission.get(id)
@@ -311,16 +374,10 @@ export default {
             log("stale, interrupting:", id, "idle", idleMin + "m", (s && s.title) || "")
             try {
               await ctx.session.interrupt({ sessionID: id, resume: false })
-              send(
-                id,
-                "[watchdog] 你因 ≥" +
-                  staleMs / 60000 +
-                  " 分钟无活动被自动打断。恢复时请先向用户汇报当前进度与卡点，再继续。",
-                "queue"
-              )
             } catch (err) {
               log("interrupt failed:", id, String(err))
             }
+            autoRevive(id, staleMs / 60000)
           }
         }
         log("sweep done:", myDir || "(no dir)", "running =", running.size)
@@ -343,7 +400,8 @@ export default {
       NUDGE_MS / 60000,
       "min, stale >",
       staleMs / 60000,
-      "min"
+      "min | opencode exe:",
+      resolveOpencode()
     )
     return () => {
       clearInterval(timer)

@@ -1,0 +1,3 @@
+﻿*.vbs
+*.log
+node_modules/

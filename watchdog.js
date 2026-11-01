@@ -42,6 +42,47 @@ function log(...a) {
   } catch {}
 }
 
+// Judge model for drift checks: prefer cheap flash-class models per the
+// house rule (deepseek-v4.1-flash > deepseek-v4-flash > glm-5.3-flash),
+// then fall back to the location default. Note model.default() returns
+// { location, data:{ providerID, modelID } } — the payload is nested.
+async function pickJudgeModel(ctx) {
+  try {
+    const list = await ctx.model.list()
+    const arr = Array.isArray(list) ? list : (list && list.data) || []
+    const cheap = arr.filter((m) => {
+      if (!m) return false
+      const id = String(m.modelID || m.id || "").toLowerCase()
+      return (
+        m.enabled !== false &&
+        /deepseek-v4\.1-flash|deepseek-v4-flash|glm-5\.3-flash/.test(id)
+      )
+    })
+    cheap.sort((a, b) => {
+      const rank = (m) => {
+        const id = String(m.modelID || m.id || "").toLowerCase()
+        let r = 2
+        if (id.includes("deepseek-v4.1-flash")) r = 0
+        else if (id.includes("deepseek-v4-flash")) r = 1
+        const p = m.providerID === "volcengine-coding-plan" ? 0 : 1
+        return r * 10 + p
+      }
+      return rank(a) - rank(b)
+    })
+    if (cheap.length > 0) {
+      const m = cheap[0]
+      return { providerID: m.providerID, id: m.modelID || m.id }
+    }
+  } catch {}
+  try {
+    const def = await ctx.model.default()
+    const d = def && def.data ? def.data : def
+    if (d && d.providerID && (d.modelID || d.id))
+      return { providerID: d.providerID, id: d.modelID || d.id }
+  } catch {}
+  return null
+}
+
 function norm(p) {
   return (p || "").replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase()
 }
@@ -96,6 +137,34 @@ export default {
     const toolHistory = new Map() // sessionID -> [inputHash,...]
     const reviveCount = new Map() // sessionID -> auto-revives this run window
 
+    // Post-mortem capture (classic NMI-before-reset): dump the hung session's
+    // tail so the human can see what it was doing when it froze.
+    const postMortem = async (id) => {
+      try {
+        const msgs = (await ctx.session.context({ sessionID: id })) || []
+        const tail = msgs
+          .slice(-8)
+          .map((m) => msgText(m).replace(/\s+/g, " ").slice(0, 300))
+          .filter(Boolean)
+        let title = ""
+        try {
+          const s = await ctx.session.get({ sessionID: id })
+          title = (s && s.title) || ""
+        } catch {}
+        const file = path.join(
+          LOG_DIR,
+          "postmortem-" + id + "-" + Date.now() + ".log"
+        )
+        fs.appendFileSync(
+          file,
+          "session: " + id + "\ntitle: " + title + "\n\n" + tail.join("\n---\n") + "\n"
+        )
+        log("post-mortem written:", file)
+      } catch (e) {
+        log("post-mortem failed:", id, String(e))
+      }
+    }
+
     const send = (sessionID, text, delivery) =>
       ctx.session
         .prompt({ sessionID, text, delivery: delivery || "steer", resume: false })
@@ -127,6 +196,33 @@ export default {
       } catch (e) {
         log("auto-revive failed:", id, String(e))
       }
+    }
+
+    // --- probe: what does this build actually expose (drift depends on it) ---
+    try {
+      log("probe: ctx keys =", Object.keys(ctx).join(","))
+      log(
+        "probe: generate =",
+        typeof (ctx.generate && ctx.generate.text),
+        "| exp.generate =",
+        typeof (ctx.experimental &&
+          ctx.experimental.generate &&
+          ctx.experimental.generate.text)
+      )
+      const md =
+        ctx.model && typeof ctx.model.default === "function"
+          ? await ctx.model.default()
+          : ctx.model && ctx.model.default
+            ? await ctx.model.default
+            : null
+      log("probe: model.default =", JSON.stringify(md))
+      try {
+        log("judge model:", JSON.stringify(await pickJudgeModel(ctx)))
+      } catch (e) {
+        log("judge model probe failed:", String(e))
+      }
+    } catch (e) {
+      log("probe failed:", String(e))
     }
 
     // --- backfill (owned + no outcome + updated within 1h) ---
@@ -256,9 +352,7 @@ export default {
           '\n判断：最近的工作是否仍在服务于该目标？只输出一行 JSON：{"drift":true|false,"reason":"不超过40字"}'
         let model = null
         try {
-          const def = await ctx.model.default()
-          if (def && def.providerID && def.modelID)
-            model = { providerID: def.providerID, id: def.modelID }
+          model = await pickJudgeModel(ctx)
         } catch {}
         const gen =
           (ctx.experimental && ctx.experimental.generate && ctx.experimental.generate.text) ||
@@ -378,6 +472,7 @@ export default {
               log("interrupt failed:", id, String(err))
             }
             autoRevive(id, staleMs / 60000)
+            void postMortem(id)
           }
         }
         log("sweep done:", myDir || "(no dir)", "running =", running.size)
@@ -410,4 +505,4 @@ export default {
       log("unloaded:", myDir || "(no dir)")
     }
   },
-}
+}// hot-reload probe 2026-11-01T19:51:43.2440905+08:00

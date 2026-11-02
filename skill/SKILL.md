@@ -47,13 +47,13 @@ API 细节（端点、Basic Auth、分页截断坑）见记忆块 opencode-ops�
 
 - 分派、汇总、审查、探索类子代理：flash 档；实现、修复类：主力模型。协调用的模型本来就不该和执行同档。
 - 主会话=Router：只做分派与验收，**不亲自跑长命令**（前台阻塞会杀会话，是你踩过的高发点）。
-- 厂商并行槽位（2026-11-01 建，`~/.config/opencode/agents/`，frontmatter 钉模型 + 权限层 deny `git push*`，已经 `/api/agent` 验证加载）：
-  - `worker-volc` → volcengine-coding-plan/deepseek-v4.1-flash（**2-3 并发**，主力槽）
+- 厂商并行槽位（2026-11-02 更新：火山两线已撤，保留四槽；`~/.config/opencode/agents/`，frontmatter 钉模型 + 权限层 deny `git push*`）：
   - `worker-bailian` → alibaba-token-plan-cn/deepseek-v4.1-flash（**仅 1 并发**，勿同时派两个）
   - `worker-go` → opencode-go/deepseek-v4.1-flash（补位槽）
   - `worker-design` → open-design/deepseek-v4.1-flash（补位槽，额度未实测）
-- 选型口径（用户裁定 11-01）：**各厂商 deepseek-v4.1-flash 优先、glm-5.3-flash 次选，其它不选**（四源都有 v4.1-flash）。
-- 并行派工路由：N 个并行按额度分配——火山 ≤2-3、百炼 ≤1、超出走 go/design。⚠️ 同名模型不同源互不相等且 ID 会漂移，钉配置前先 `opencode models` 核对。
+  - `worker-ds` → deepseek/deepseek-flash（官方 API 补位槽）
+- 选型口径（用户裁定）：**各厂商 deepseek-v4.1-flash 优先、glm-5.3-flash 次选，其它不选**。
+- 并行派工路由：N 个并行按额度分配——百炼 ≤1，超出走 go/design/ds。⚠️ 同名模型不同源互不相等且 ID 会漂移，钉配置前先 `opencode models` 核对。
 
 ## 4. 异步与全双工
 

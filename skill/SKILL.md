@@ -28,12 +28,13 @@ metadata:
 
 API 细节（端点、Basic Auth、分页截断坑）见记忆块 opencode-ops；长跑命令的输出落盘+退出码写文件纪律见 windows-shell-gotchas。
 
-**定稿方案（2026-11-01）：V2 server 插件 `~/.config/opencode/plugins/watchdog.js` v5**——`export default { id, setup }`；**按 location 归属**；事件流订阅 execution.*/tool.*/permission.*；setup backfill（无 outcome 且 1h 内有活动）。5 分钟 sweep：
+**定稿方案（2026-11-02 更新）：V2 server 插件 `~/.config/opencode/plugins/watchdog.js` v6**——`export default { id, setup }`；**按 location 归属**；事件流订阅 execution.*/tool.*/permission.*；setup backfill（无 outcome 且 1h 内有活动）。5 分钟 sweep：
 - **L1 15min 静默 → nudge**（steer ping，每 run 一次）
 - **L2 循环检测**：同工具同参数连续 ×3 → steer 警告
 - **L3 漂移检测**：长跑 ≥30min、每 60min 一次，默认模型判定，**只告警不打断**
-- **L4 30min 静默 → interrupt**（bmall 90min）+ **自动复活**（detached `opencode run --continue` 报告型指令，上限 2 次/run）——queue 提示不唤醒 idle，必须驱动
+- **L4 30min 静默 → 先警告、次轮仍静默才 interrupt**（bmall 90min）+ **自动复活**（detached `opencode run --continue` 报告型指令，上限 2 次/run）——queue 提示不唤醒 idle，必须驱动
 - 门控：**worker 子会话豁免**（parentID≠null 跳过 nudge/interrupt——worker 归主会话管；实测打断 worker 造成 W-5 重派 5 次的恶性循环）；busy 父会话（有运行中子代理）只 ping 不打断；permission 卡片等待跳过；`session.tool.progress` 续命
+- **goal 感知**：原生 `/goal`（v2.2.1+）状态经 RPC `opencode.goal.get({sessionID})` 可读——`status=active` 的会话**全跳过**（nudge/警告/打断/漂移），交给 goal 引擎（idle-hook 续跑 + judge 评审，maxRounds 默认 50、连续 stall 3 次自动 pause）。长任务开工用 `/goal <objective>`（pause/resume/clear）
 - **救援口诀**：提示词无效（idle 会话不吃 prompt）⇒ interrupt + `opencode run -s <id> --continue`；`tools/` 外也有一键脚本 `revive_session.js`
 实测教训：server-plugin console.log 不进 opencode.log（自写 plugin.log）；按 location 多实例加载；backfill 只用「无 outcome」会捞 85 天前老会话。生态调研（GitHub 40 个 watchdog 仓库）：无可替换方案——akane（V2 插件，Ping 先于 interrupt）、superadvisor（独立模型漂移审查）、ertval（nudge 升级）三个机制已吸收进 v3；jev-watch 依赖外部决策模型、chenxuan520/opencode-watchdog 每回合烧 judge、其余平台/依赖不合。
 

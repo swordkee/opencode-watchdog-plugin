@@ -170,6 +170,28 @@ export default {
         .prompt({ sessionID, text, delivery: delivery || "steer", resume: false })
         .catch((e) => log("steer failed:", sessionID, String(e)))
 
+    // Goal awareness: the native /goal plugin exposes RPC "opencode.goal"
+    // with get({sessionID}) -> Goal.State|null. While a goal is active the
+    // goal engine itself continues the session on idle (its own reviewer +
+    // continuation loop), so the watchdog hands off: no nudge, no warning,
+    // no interrupt, no drift check.
+    let goalClient = null
+    try {
+      goalClient = ctx.rpc({ id: "opencode.goal", methods: { get: {} }, events: {} })
+      log("goal rpc attached")
+    } catch (e) {
+      log("goal rpc unavailable:", String(e))
+    }
+    const goalActive = async (sessionID) => {
+      if (!goalClient) return false
+      try {
+        const g = await goalClient.get({ sessionID })
+        return !!(g && g.status === "active")
+      } catch {
+        return false
+      }
+    }
+
     // Interrupt alone leaves an idle session with queued notes nobody reads
     // (prompts never wake an idle session). Drive it with the documented
     // revive flow so it reports and can continue. Capped per run window.
@@ -276,6 +298,7 @@ export default {
               lastSeen: Date.now(),
               startedAt: Date.now(),
               nudged: false,
+              warned: false,
               loopWarned: false,
               lastDriftAt: 0,
             })
@@ -291,11 +314,15 @@ export default {
             toolHistory.delete(id)
           } else if (event.type === "session.tool.progress") {
             const e0 = running.get(id)
-            if (e0) e0.lastSeen = Date.now()
+            if (e0) {
+              e0.lastSeen = Date.now()
+              e0.warned = false
+            }
           } else if (event.type === "session.tool.called") {
             const e0 = running.get(id)
             if (!e0) continue
             e0.lastSeen = Date.now()
+            e0.warned = false
             // L2 loop detection: 3 identical tool inputs in a row
             try {
               const h = JSON.stringify(d.input || {})
@@ -438,6 +465,18 @@ export default {
             continue
           }
 
+          // gate: an ACTIVE goal session is driven by the native goal engine
+          // (idle-hook continuation + reviewer) — hands off entirely.
+          if (
+            idleMin >= NUDGE_MS / 60000 ||
+            (e.startedAt && now - e.startedAt >= DRIFT_MIN_RUN_MS)
+          ) {
+            if (await goalActive(id)) {
+              log("goal-active, skip:", id, idleMin + "m")
+              continue
+            }
+          }
+
           // L3 drift (long runs only, every 60 min, warn-only)
           if (
             e.startedAt &&
@@ -463,8 +502,21 @@ export default {
             )
           }
 
-          // L4 interrupt
+          // L4 interrupt with pre-kill warning (ping-before-kill): the first
+          // time past the threshold only warns; interrupt on the NEXT sweep if
+          // the session is still silent — protects long tools/长回合.
           if (idleMin >= staleMs / 60000) {
+            if (!e.warned) {
+              e.warned = true
+              log("pre-kill warning:", id, "idle", idleMin + "m", (s && s.title) || "")
+              send(
+                id,
+                "[watchdog] 你已 " +
+                  idleMin +
+                  " 分钟无活动；若下一轮巡检前仍无进展将被自动打断并复苏。若在长任务中请继续。"
+              )
+              continue
+            }
             log("stale, interrupting:", id, "idle", idleMin + "m", (s && s.title) || "")
             try {
               await ctx.session.interrupt({ sessionID: id, resume: false })

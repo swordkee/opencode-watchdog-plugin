@@ -56,11 +56,10 @@ API 细节（端点、Basic Auth、分页截断坑）见记忆块 opencode-ops�
   - `worker-go` → opencode-go/deepseek-v4.1-flash（op 主号）
   - `worker-go2` → opencode-go-2/deepseek-v4.1-flash（op neurondev 号；**Default 号无订阅，403 不可用**）
   - `worker-design` → open-design/deepseek-v4.1-flash（design 号）
-  - `worker-ds` → deepseek/deepseek-flash（官方 API 补位槽）
 - 选型口径（用户裁定）：**各厂商 deepseek-v4.1-flash 优先、glm-5.3-flash 次选，其它不选**；同模型跨账号并行即可，不必换模型。
 - 并行容量（实测）：百炼 2 号 × ≥3 并发、opencode-go 2 号、design 1 号；**5 个 worker 槽同时派工**。
 - **派工门槛**：预计 <15 分钟的小任务**主会话直接做**（子代理的冷启动+worktree+重新读上下文比直接做慢）；只有 >30min、独立、可验证的任务才派。工单必须塞满「已确证事实 + 文件清单」，否则子代理重新考古的时间比干活还长。
-- **派工前自查配额**：`node tools/provider-health.js`（探 4 个号，429 会打印 retry-after）。2026-11-18 实测：magiclight 月配额耗尽（11-20 16:00 UTC 重置），鑫小汇正常 ⇒ 派工前先看，别把任务丢进重试黑洞。
+- **派工前自查配额**：`node tools/provider-health.js` 输出各号状态（429 带 retry-after）；`--pick` 直接输出当前最健康的 worker 槽名（按延迟排序，可直接用它派工）。2026-11-18 实测：magiclight 月配额耗尽（11-20 16:00 UTC 重置），鑫小汇正常 ⇒ 别把任务丢进重试黑洞。
 
 ## 4. 异步与全双工
 

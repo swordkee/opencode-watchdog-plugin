@@ -36,7 +36,7 @@ API 细节（端点、Basic Auth、分页截断坑）见记忆块 opencode-ops�
 - **长工具保护**：子会话最新 assistant 回合仍有未完成工具（go build/protoc/test）⇒ 不打断；`session.tool.progress` 续命
 - **通知投递**：目标 running → steer；**idle → `opencode run -s <id> --continue --auto "<文本>"` 主动唤醒**（否则 prompt 只进 inbox），每会话上限 6 次；去重持久化在 `watchdog/notify-state.json`（7 天清理）
 - **救援口诀**：需要人工救会话时仍用 interrupt + `opencode run -s <id> --continue`；`tools/revive_session.js`
-实测教训：server-plugin console.log 不进 opencode.log（自写 plugin.log）；按 location 多实例加载；backfill 只用「无 outcome」会捞 85 天前老会话。生态调研（GitHub 40 个 watchdog 仓库）：无可替换方案——akane（V2 插件，Ping 先于 interrupt）、superadvisor（独立模型漂移审查）、ertval（nudge 升级）三个机制已吸收进 v3；jev-watch 依赖外部决策模型、chenxuan520/opencode-watchdog 每回合烧 judge、其余平台/依赖不合。
+生态复核（2026-11-25）：**没有可直接替换 v11 的同款插件**。最接近的 `Mte90/opencode-auto-resume`（V1/V2，GPL-3.0）会自动恢复根会话，与本插件「根会话由人负责」冲突，**禁止并存**；`joeyism/opencode-keepalive`（MIT）最轻，可借鉴按工具 stall budget/bash 分类，但 V2 options 示例需实测；`hueyexe/opencode-ensemble`（MIT）是完整团队编排，可借鉴 token/step 进度与通知去重；`Dqz00116/opencode-agents-monitor`（MIT，V2 beta）只做 TUI 观察；`mohak34/opencode-notifier`（MIT）只做桌面通知；`ByBrawe/opencode-loop`（MIT）只做 idle 调度。完整对比与优化 backlog 见备份仓 `README.md`「同类插件与优化候选」。
 
 ## 2. 派工：直通优先
 

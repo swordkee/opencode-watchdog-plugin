@@ -14,6 +14,10 @@
 //   4 h idle     -> interrupt that child + notify its parent
 // The v3 root-supervision helpers below are retained but intentionally disabled.
 //
+// v12 (2026-11-25): V2.4 event.data + agent-message compatibility; child
+// terminal error/empty-finish detection; per-tool stall budgets; parent
+// notification batching; wake budget resets only on a real user prompt.
+//
 // Layers (all logged to ~/.local/state/opencode/watchdog/plugin.log):
 const EVERY_MS = 5 * 60 * 1000
 const DEFAULT_STALE_MS = 30 * 60 * 1000
@@ -119,6 +123,126 @@ function owns(myDir, sessionDir) {
   return s === myDir || s.startsWith(myDir + "/")
 }
 
+const QUICK_TOOL_MS = 2 * 60 * 1000
+const LONG_TOOL_MS = 30 * 60 * 1000
+const SUBAGENT_TOOL_MS = 60 * 60 * 1000
+const QUICK_TOOLS = new Set([
+  "read", "edit", "write", "patch", "multiedit", "apply_patch",
+  "grep", "glob", "list",
+])
+
+// V2.4 moved event payloads to event.data; older builds used
+// event.properties.data or event.properties directly. Keep one parser so a
+// host upgrade cannot silently disable terminal/tool supervision.
+function parseSessionEvent(event) {
+  if (!event || !event.type) return null
+  const p = event.properties || {}
+  const data = event.data || p.data || p
+  const sessionID =
+    (data && data.sessionID) ||
+    (p.info && (p.info.id || p.info.sessionID))
+  if (!sessionID) return null
+  return { type: event.type, sessionID, data }
+}
+
+function isAssistantMessage(m) {
+  return !!m && (m.type === "assistant" || m.type === "agent")
+}
+
+function errorCategory(error) {
+  const e = error || {}
+  const name = String(e.name || e.type || e.code || "")
+  const message = String(e.message || "")
+  const text = (name + " " + message).toLowerCase()
+  if (/429|rate.?limit|quota|insufficient/.test(text)) return "provider_rate_limit"
+  if (/401|403|auth|permission|forbidden|unauthorized/.test(text)) return "provider_auth"
+  if (/timeout|timed.?out|deadline/.test(text)) return "provider_timeout"
+  if (/network|connection|socket|stream|reset|closed/.test(text)) return "provider_network"
+  return "provider_error"
+}
+
+function classifyChildTerminal({ eventType, reason, error, messages }) {
+  if (eventType === "session.execution.failed") {
+    return { kind: "provider_error", category: errorCategory(error) }
+  }
+  if (eventType === "session.execution.interrupted") {
+    return reason === "inactivity" ? { kind: "execution_inactivity" } : null
+  }
+  if (eventType !== "session.execution.succeeded") return null
+  const list = Array.isArray(messages) ? messages : []
+  const last = [...list].reverse().find(isAssistantMessage)
+  if (!last) return null
+  const parts = last.content || last.parts || []
+  const hasText = parts.some(
+    (p) => p && p.type === "text" && String(p.text || "").trim().length > 0
+  )
+  const hasTool = parts.some((p) => p && p.type === "tool")
+  return hasText || hasTool ? null : { kind: "empty_finish" }
+}
+
+function sanitizeDiagnostic(value, max = 160) {
+  let s = String(value == null ? "" : value)
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  s = s
+    .replace(/\bBearer\s+[^\s]+/gi, "Bearer [REDACTED]")
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, "[REDACTED]")
+    .replace(
+      /\b(?:sk|pk|api[_-]?key|access[_-]?key|token|secret|password|passwd|pwd|private[_-]?key)[-_=:]\s*[A-Za-z0-9._-]{8,}/gi,
+      "[REDACTED]"
+    )
+  if (max > 0 && s.length > max) s = s.slice(0, max) + "…"
+  return s
+}
+
+function toolBudgetMs(name, input) {
+  const n = String(name || "").toLowerCase()
+  if (QUICK_TOOLS.has(n)) return QUICK_TOOL_MS
+  if (n === "subagent" || n === "task") return SUBAGENT_TOOL_MS
+  if (n === "websearch" || n === "webfetch") return 5 * 60 * 1000
+  if (n === "shell" || n === "bash") {
+    const cmd = String((input && input.command) || "")
+    const seg = cmd
+      .split(/\r?\n|;|&&|\|\|/)
+      .map((x) => x.trim())
+      .find((x) => x && !/^cd\b/i.test(x)) || ""
+    return READ_SHELL.test(seg) ? QUICK_TOOL_MS : LONG_TOOL_MS
+  }
+  return LONG_TOOL_MS
+}
+
+function isToolStalled(startedAt, now, budgetMs) {
+  const start = Number(startedAt)
+  const budget = Number(budgetMs)
+  return Number.isFinite(start) && start > 0 && Number.isFinite(budget) && budget > 0 && now - start >= budget
+}
+
+function aggregateParentNotifications(items) {
+  const groups = new Map()
+  for (const item of Array.isArray(items) ? items : []) {
+    const parentID = item && item.parentID
+    const text = sanitizeDiagnostic(item && item.text, 500)
+    if (!parentID || !text) continue
+    if (!groups.has(parentID)) groups.set(parentID, [])
+    const lines = groups.get(parentID)
+    if (!lines.includes(text)) lines.push(text)
+  }
+  const out = []
+  for (const [parentID, all] of groups) {
+    const lines = all.slice(0, 12)
+    let text = "[watchdog] 检测到 " + lines.length + " 个子会话异常：\n" + lines.map((x) => "- " + x).join("\n")
+    if (all.length > lines.length) text += "\n- …另有 " + (all.length - lines.length) + " 条"
+    if (text.length > 3800) text = text.slice(0, 3799) + "…"
+    out.push({ parentID, text })
+  }
+  return out
+}
+
+function isWatchdogPrompt(text) {
+  return /^\s*\[watchdog\]/i.test(String(text || ""))
+}
+
 // v7: authoritative "is running" source. v2.2.5 keeps `outcome` on RUNNING
 // sessions (it holds the previous execution's outcome), so the old
 // `!s.outcome` backfill matched nothing, and events alone never re-add a
@@ -169,10 +293,11 @@ function writeNotifyState(o) {
   } catch {}
 }
 
-// Long running tools (go build, protoc, tests) produce no new messages while
-// they run; never interrupt a session whose newest assistant turn still has a
-// tool in progress.
-async function fetchRunningTool(id) {
+// Snapshot running tools from the message API. V2.4 names assistant messages
+// `agent` and stores tool start time at part.time.ran; older builds used
+// `assistant`. This fallback reconstructs tools that started before the plugin
+// loaded or while the event stream was reconnecting.
+async function fetchToolStates(id) {
   try {
     const sj = JSON.parse(fs.readFileSync(SERVICE_JSON, "utf8"))
     const auth = "Basic " + Buffer.from("opencode:" + sj.password).toString("base64")
@@ -180,22 +305,32 @@ async function fetchRunningTool(id) {
       "http://127.0.0.1:" + (sj.port || 49374) + "/api/session/" + id + "/message?limit=3",
       { headers: { Authorization: auth, Accept: "application/json" } }
     )
-    if (!r.ok) return false
+    if (!r.ok) return null
     const j = await r.json()
     const arr = (j && (j.data || j)) || []
     for (const m of arr) {
-      if (!m || m.type !== "assistant") continue
+      if (!isAssistantMessage(m)) continue
+      const out = []
       for (const p of m.content || m.parts || []) {
-        const st = p && p.type === "tool" && p.state && String(p.state.status || "")
-        if (st && !["completed", "error", "failed", "cancelled"].includes(st)) return true
+        if (!p || p.type !== "tool" || !p.state) continue
+        const st = String(p.state.status || "")
+        if (["completed", "error", "failed", "cancelled"].includes(st)) continue
+        out.push({
+          id: p.id || "",
+          name: p.name || "unknown",
+          input: p.state.input || p.input || {},
+          startedAt: Number((p.time && (p.time.ran || p.time.created)) || 0),
+          status: st,
+        })
       }
-      break
+      return out
     }
-    return false
+    return []
   } catch {
-    return false
+    return null
   }
 }
+
 // by inbox/steer deliveries, so a fake-dead session can look "0 min idle"
 // while producing nothing for an hour. Messages only advance when the session
 // actually produces turns.
@@ -249,7 +384,7 @@ async function fetchRecent(id, windowMs) {
       const t = m && m.time && (m.time.completed || m.time.created)
       if (!t) continue
       if (t > last) last = t
-      if (m.type !== "assistant") continue
+      if (!isAssistantMessage(m)) continue
       if (t >= now - windowMs) turnsInWindow++
       const parts = m.content || m.parts || []
       const productive = parts.some(isProductivePart)
@@ -264,7 +399,7 @@ async function fetchRecent(id, windowMs) {
 function msgText(m) {
   try {
     if (m && typeof m.text === "string" && m.text) return m.text
-    const parts = (m && m.parts) || []
+    const parts = (m && (m.content || m.parts)) || []
     const t = parts
       .map((p) => (p && typeof p.text === "string" ? p.text : ""))
       .filter(Boolean)
@@ -278,6 +413,15 @@ function msgText(m) {
 
 export default {
   id: "watchdog",
+  // Exposed for the offline rule gate; the host ignores extra properties.
+  parseSessionEvent,
+  isAssistantMessage,
+  classifyChildTerminal,
+  sanitizeDiagnostic,
+  toolBudgetMs,
+  isToolStalled,
+  aggregateParentNotifications,
+  isWatchdogPrompt,
   async setup(ctx) {
     const myDir = norm(ctx.location && ctx.location.directory)
     const staleMs = STALE_OVERRIDES[myDir] || DEFAULT_STALE_MS
@@ -286,8 +430,23 @@ export default {
     const parentIDs = new Map() // sessionID -> parentID; roots are absent/empty
     const pendingPermission = new Map() // sessionID -> askedAt
     const toolHistory = new Map() // sessionID -> [inputHash,...]
+    const toolNames = new Map() // tool call ID -> tool name (input.started)
+    const activeTools = new Map() // sessionID -> Map(toolID -> {name,input,startedAt,budgetMs,notified})
+    const executionGen = new Map() // sessionID -> increments on each real execution start
+    const terminalChecked = new Map() // sessionID -> terminal event already inspected this execution
     const reviveCount = new Map() // sessionID -> auto-revives this run window
-    const wakeCount = new Map() // sessionID -> wakes spawned (idle-session nudges)
+    const wakeCount = new Map() // sessionID -> wakes spawned since the last real user prompt
+    const pendingNotifications = new Map() // parentID -> {lines,timer}
+    const pendingTimers = new Set()
+    const schedule = (fn, ms) => {
+      const timer = setTimeout(() => {
+        pendingTimers.delete(timer)
+        fn()
+      }, ms)
+      pendingTimers.add(timer)
+      if (timer.unref) timer.unref()
+      return timer
+    }
     const WAKE_CAP = 6
 
     // Cross-reload notify dedupe (reloads reset in-memory flags).
@@ -375,6 +534,34 @@ export default {
         log("wake spawned:", sessionID, "n=" + (n + 1))
       } catch (e) {
         log("wake failed:", sessionID, String(e))
+      }
+    }
+
+    // Batch child alerts per parent for 2 seconds. Ten children failing in one
+    // sweep must produce one parent wake, not ten competing turns.
+    const queueParentNotification = (parentID, text) => {
+      const clean = sanitizeDiagnostic(text, 500)
+      if (!parentID || !clean) return
+      let entry = pendingNotifications.get(parentID)
+      if (!entry) {
+        entry = { lines: [], timer: null }
+        pendingNotifications.set(parentID, entry)
+      }
+      if (!entry.lines.includes(clean)) entry.lines.push(clean)
+      if (!entry.timer) {
+        entry.timer = schedule(() => {
+          pendingNotifications.delete(parentID)
+          void flushParentNotifications(parentID, entry.lines)
+        }, 2000)
+      }
+    }
+
+    const flushParentNotifications = async (parentID, lines) => {
+      for (const item of aggregateParentNotifications(
+        lines.map((text) => ({ parentID, text }))
+      )) {
+        log("parent notify:", parentID, "alerts=" + lines.length)
+        await send(parentID, item.text)
       }
     }
 
@@ -480,33 +667,184 @@ export default {
       log("backfill failed:", String(e))
     }
 
+    const inspectChildTerminal = async (id, eventType, data, gen) => {
+      let parentID = parentIDs.get(id)
+      if (!parentID) {
+        try {
+          const s = await ctx.session.get({ sessionID: id })
+          parentID = s && s.parentID
+          if (parentID) parentIDs.set(id, parentID)
+        } catch {
+          return
+        }
+      }
+      if (!parentID) return
+      // Let the final assistant message settle before deciding that a
+      // successful execution produced no usable result.
+      if (eventType === "session.execution.succeeded") {
+        await new Promise((resolve) => schedule(resolve, 3000))
+      }
+      if (executionGen.get(id) !== gen) return
+      let messages = []
+      if (eventType === "session.execution.succeeded") {
+        try {
+          messages = (await ctx.session.context({ sessionID: id })) || []
+        } catch {
+          return
+        }
+      }
+      const verdict = classifyChildTerminal({
+        eventType,
+        reason: data && data.reason,
+        error: data && data.error,
+        messages,
+      })
+      if (!verdict) return
+      let title = id
+      try {
+        const s = await ctx.session.get({ sessionID: id })
+        title = sanitizeDiagnostic((s && s.title) || id, 80)
+      } catch {}
+      const detail =
+        verdict.kind === "provider_error"
+          ? "以 " + verdict.category + " 结束，未返回可用结果"
+          : verdict.kind === "empty_finish"
+            ? "执行成功但没有最终文本或工具结果（空回复）"
+            : "因 inactivity 被系统中断"
+      markNotified(id, "terminal", 10 * 60 * 1000)
+      log("child terminal -> notify parent:", id, verdict.kind, verdict.category || "")
+      queueParentNotification(
+        parentID,
+        "子会话「" + title + "」" + detail + "。请检查并决定重试、收口或重派。"
+      )
+    }
+
+    const trackTool = (id, d) => {
+      if (!d || !d.id) return
+      const name = toolNames.get(d.id) || "unknown"
+      const input = d.input || {}
+      let map = activeTools.get(id)
+      if (!map) {
+        map = new Map()
+        activeTools.set(id, map)
+      }
+      map.set(d.id, {
+        id: d.id,
+        name,
+        input,
+        startedAt: Date.now(),
+        budgetMs: toolBudgetMs(name, input),
+        notified: false,
+      })
+    }
+
+    const clearTool = (id, toolID) => {
+      toolNames.delete(toolID)
+      const map = activeTools.get(id)
+      if (!map) return
+      map.delete(toolID)
+      if (map.size === 0) activeTools.delete(id)
+    }
+
+    const reconcileTools = (id, states) => {
+      if (!states) return
+      const map = new Map()
+      for (const t of states) {
+        const prev = activeTools.get(id) && activeTools.get(id).get(t.id)
+        const name = t.name && t.name !== "unknown" ? t.name : (prev && prev.name) || "unknown"
+        const input = t.input || (prev && prev.input) || {}
+        const startedAt = t.startedAt || (prev && prev.startedAt) || 0
+        map.set(t.id, {
+          id: t.id,
+          name,
+          input,
+          startedAt,
+          budgetMs: toolBudgetMs(name, input),
+          notified: !!(prev && prev.notified),
+        })
+      }
+      if (map.size) activeTools.set(id, map)
+      else activeTools.delete(id)
+    }
+
+    const hasProtectedTool = (id, now) => {
+      const map = activeTools.get(id)
+      if (!map || map.size === 0) return false
+      for (const t of map.values()) {
+        // Unknown start time is protected: fail closed rather than kill a tool
+        // whose age we cannot establish.
+        if (!isToolStalled(t.startedAt, now, t.budgetMs)) return true
+      }
+      return false
+    }
+
+    // A watchdog wake is itself a user-role prompt. Only a REAL user prompt
+    // resets the per-parent wake budget; otherwise six alerts would become a
+    // permanent lifetime cap or reset on every plugin reload.
+    try {
+      await ctx.session.hook("prompt", (event) => {
+        const id = event && event.sessionID
+        if (!id) return
+        const text =
+          (event.prompt && event.prompt.text) ||
+          (event.prompt && event.prompt.content) ||
+          ""
+        if (!isWatchdogPrompt(text)) wakeCount.delete(id)
+      })
+      log("prompt hook attached")
+    } catch (e) {
+      log("prompt hook unavailable:", String(e))
+    }
+
     // --- event stream ---
     const controller = new AbortController()
     void (async () => {
       try {
         for await (const event of ctx.event.subscribe({
           types: [
+            "session.created",
+            "session.deleted",
             "session.execution.started",
             "session.execution.succeeded",
             "session.execution.failed",
             "session.execution.interrupted",
             "session.idle",
+            "session.tool.input.started",
             "session.tool.progress",
             "session.tool.called",
+            "session.tool.success",
+            "session.tool.failed",
             "permission.asked",
             "permission.replied",
           ],
           signal: controller.signal,
         })) {
-          const p = event.properties || {}
-          const d = p.data || p
-          const id = d.sessionID || (p.info && (p.info.id || p.info.sessionID))
-          if (!id) continue
+          const parsed = parseSessionEvent(event)
+          if (!parsed) continue
+          const { type: eventType, sessionID: id, data: d } = parsed
 
-          if (event.type === "session.execution.started") {
-            const parentID = p.info && p.info.parentID
-            if (parentID) parentIDs.set(id, parentID)
+          if (eventType === "session.created") {
+            if (d.parentID) parentIDs.set(id, d.parentID)
             else parentIDs.delete(id)
+          } else if (eventType === "session.deleted") {
+            running.delete(id)
+            parentIDs.delete(id)
+            toolHistory.delete(id)
+            activeTools.delete(id)
+            executionGen.delete(id)
+            terminalChecked.delete(id)
+            pendingPermission.delete(id)
+          } else if (eventType === "session.execution.started") {
+            if (!parentIDs.has(id)) {
+              void ctx.session.get({ sessionID: id })
+                .then((s) => {
+                  if (s && s.parentID) parentIDs.set(id, s.parentID)
+                })
+                .catch(() => {})
+            }
+            executionGen.set(id, (executionGen.get(id) || 0) + 1)
+            terminalChecked.delete(id)
+            activeTools.delete(id)
             running.set(id, {
               lastSeen: Date.now(),
               startedAt: Date.now(),
@@ -518,30 +856,41 @@ export default {
             toolHistory.set(id, [])
             reviveCount.set(id, 0)
           } else if (
-            event.type === "session.execution.succeeded" ||
-            event.type === "session.execution.failed" ||
-            event.type === "session.execution.interrupted" ||
-            event.type === "session.idle"
+            eventType === "session.execution.succeeded" ||
+            eventType === "session.execution.failed" ||
+            eventType === "session.execution.interrupted"
           ) {
-            running.delete(id) // stale-relevant state ends with the run
+            const gen = executionGen.get(id) || 0
+            if (!terminalChecked.get(id)) {
+              terminalChecked.set(id, true)
+              void inspectChildTerminal(id, eventType, d, gen)
+            }
+            running.delete(id)
             toolHistory.delete(id)
-          } else if (event.type === "session.tool.progress") {
+            activeTools.delete(id)
+          } else if (eventType === "session.idle") {
+            running.delete(id)
+            toolHistory.delete(id)
+            activeTools.delete(id)
+          } else if (eventType === "session.tool.input.started") {
+            if (d.id) toolNames.set(d.id, d.name || "unknown")
+          } else if (eventType === "session.tool.progress") {
             const e0 = running.get(id)
             if (e0) {
               e0.lastSeen = Date.now()
               e0.warned = false
             }
-          } else if (event.type === "session.tool.called") {
+          } else if (eventType === "session.tool.called") {
+            trackTool(id, d)
             const e0 = running.get(id)
             if (!e0) continue
             e0.lastSeen = Date.now()
             e0.warned = false
             // v11 loop detection: only CHILD sessions are auto-supervised.
-            // Report the child's loop to its parent; never ping a root session
-            // for doing the same read three times (a lead often does exactly
-            // that while coordinating).
+            // Fingerprint tool name + args so alternating loops are visible.
             try {
-              const h = JSON.stringify(d.input || {})
+              const name = toolNames.get(d.id) || "unknown"
+              const h = JSON.stringify({ name, input: d.input || {} })
               const hist = toolHistory.get(id) || []
               hist.push(h)
               if (hist.length > 6) hist.shift()
@@ -557,17 +906,20 @@ export default {
               ) {
                 e0.loopWarned = true
                 log("child loop -> notify parent:", id)
-                send(
+                queueParentNotification(
                   parentID,
-                  "[watchdog] 你派发的子会话「" +
-                    ((p.info && p.info.title) || id) +
-                    "」连续 3 次以相同参数调用同一工具，疑似陷入循环。请检查它是否需要换策略或中断重派。"
+                  "子会话「" + id + "」连续 3 次以相同参数调用同一工具，疑似陷入循环。请检查它是否需要换策略或中断重派。"
                 )
               }
             } catch {}
-          } else if (event.type === "permission.asked") {
+          } else if (
+            eventType === "session.tool.success" ||
+            eventType === "session.tool.failed"
+          ) {
+            clearTool(id, d.id)
+          } else if (eventType === "permission.asked") {
             pendingPermission.set(id, Date.now())
-          } else if (event.type === "permission.replied") {
+          } else if (eventType === "permission.replied") {
             pendingPermission.delete(id)
           }
         }
@@ -635,12 +987,10 @@ export default {
         log("drift result:", id, String(text).replace(/\s+/g, " ").slice(0, 200))
         if (s.parentID && /"drift"\s*:\s*true/.test(String(text))) {
           const reason = (String(text).match(/"reason"\s*:\s*"([^"]*)"/) || [])[1] || "方向偏移"
-          send(
+          queueParentNotification(
             s.parentID,
-            "[watchdog] 你派发的子会话「" +
-              ((s && s.title) || id) +
-              "」最近的工作疑似偏离原始目标（" +
-              reason +
+            "子会话「" + sanitizeDiagnostic((s && s.title) || id, 80) +
+              "」最近的工作疑似偏离原始目标（" + sanitizeDiagnostic(reason, 80) +
               "）。请核对它的任务目标；必要时纠偏或重派。"
           )
         }
@@ -664,6 +1014,7 @@ export default {
             if (!activeIds.has(id)) {
               running.delete(id)
               toolHistory.delete(id)
+              activeTools.delete(id)
             }
           }
           for (const id of activeIds) {
@@ -676,6 +1027,8 @@ export default {
             }
             if (!s0) continue
             if (!owns(myDir, s0.location && s0.location.directory)) continue
+            if (s0.parentID) parentIDs.set(id, s0.parentID)
+            else parentIDs.delete(id)
             const upd0 = s0.time && s0.time.updated ? Number(s0.time.updated) : 0
             const busy0 = s0.time && s0.time.busy ? Number(s0.time.busy) : 0
             const created0 = s0.time && s0.time.created ? Number(s0.time.created) : 0
@@ -740,11 +1093,9 @@ export default {
               (now - (recent.lastProductive || now - SPIN_MS)) / 60000
             )
             log("spin -> notify parent:", id, spinMin + "m without writes")
-            send(
+            queueParentNotification(
               s.parentID,
-              "[watchdog] 你派发的子会话「" +
-                ((s && s.title) || id) +
-                "」已 " +
+              "子会话「" + sanitizeDiagnostic((s && s.title) || id, 80) + "」已 " +
                 spinMin +
                 " 分钟只有读取/确认、没有任何写操作（空转）。请检查它是否在反复核对；必要时给硬指令或中断重派。"
             )
@@ -756,10 +1107,39 @@ export default {
           // as a last resort after 4 h. This bounds the blast radius and
           // avoids a global "worker" policy.
           if (s.parentID) {
-            const childTitle = (s && s.title) || id
+            const childTitle = sanitizeDiagnostic((s && s.title) || id, 80)
+
+            // Reconcile event-tracked tools with the server snapshot. This
+            // catches tools that started before plugin load or during an event
+            // reconnect, and clears stale entries after a missed success event.
+            const toolStates = await fetchToolStates(id)
+            reconcileTools(id, toolStates)
+            const toolMap = activeTools.get(id)
+            if (toolMap) {
+              for (const t of toolMap.values()) {
+                if (
+                  t.startedAt &&
+                  isToolStalled(t.startedAt, now, t.budgetMs) &&
+                  !t.notified &&
+                  !notifiedRecently(id, "tool:" + t.id, 30 * 60 * 1000)
+                ) {
+                  t.notified = true
+                  markNotified(id, "tool:" + t.id, 30 * 60 * 1000)
+                  const min = Math.round((now - t.startedAt) / 60000)
+                  log("child tool stall -> notify parent:", id, sanitizeDiagnostic(t.name, 40), min + "m")
+                  queueParentNotification(
+                    s.parentID,
+                    "子会话「" + childTitle + "」的 " + sanitizeDiagnostic(t.name, 40) +
+                      " 工具已运行 " + min + " 分钟未结束（预算 " +
+                      Math.round(t.budgetMs / 60000) + " 分钟）。请检查是否卡死。"
+                  )
+                }
+              }
+            }
+
             if (idleMin >= CHILD_INTERRUPT_MS / 60000) {
-              if (await fetchRunningTool(id)) {
-                log("skip child interrupt (tool running):", id, idleMin + "m")
+              if (hasProtectedTool(id, now)) {
+                log("skip child interrupt (tool within budget):", id, idleMin + "m")
                 continue
               }
               log("child stale, interrupting:", id, "idle", idleMin + "m", childTitle)
@@ -768,13 +1148,10 @@ export default {
               } catch (err) {
                 log("child interrupt failed:", id, String(err))
               }
-              send(
+              queueParentNotification(
                 s.parentID,
-                "[watchdog] 你派发的子会话「" +
-                  childTitle +
-                  "」已 " +
-                  idleMin +
-                  " 分钟无活动，已自动打断。请检查其产出或重新派发。"
+                "子会话「" + childTitle + "」已 " + idleMin +
+                  " 分钟无活动，且没有仍在预算内运行的工具，已自动打断。请检查其产出或重新派发。"
               )
               continue
             }
@@ -785,15 +1162,11 @@ export default {
             ) {
               markNotified(id, "child")
               log("child idle -> notify parent:", id, "idle", idleMin + "m")
-              send(
+              queueParentNotification(
                 s.parentID,
-                "[watchdog] 你派发的子会话「" +
-                  childTitle +
-                  "」已 " +
-                  idleMin +
+                "子会话「" + childTitle + "」已 " + idleMin +
                   " 分钟无活动；若已卡死请介入或重新派发（≥" +
-                  CHILD_INTERRUPT_MS / 3600000 +
-                  "h 将自动打断）。"
+                  CHILD_INTERRUPT_MS / 3600000 + "h 将自动打断）。"
               )
             }
             continue
@@ -822,7 +1195,7 @@ export default {
     if (boot.unref) boot.unref()
 
     log(
-      "loaded:",
+      "loaded: v12",
       myDir || "(no dir)",
       "| every",
       EVERY_MS / 60000,
@@ -837,6 +1210,9 @@ export default {
       clearInterval(timer)
       clearTimeout(boot)
       controller.abort()
+      for (const t of pendingTimers) clearTimeout(t)
+      pendingTimers.clear()
+      pendingNotifications.clear()
       log("unloaded:", myDir || "(no dir)")
     }
   },

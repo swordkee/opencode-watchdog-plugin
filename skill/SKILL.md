@@ -28,15 +28,19 @@ metadata:
 
 API 细节（端点、Basic Auth、分页截断坑）见记忆块 opencode-ops；长跑命令的输出落盘+退出码写文件纪律见 windows-shell-gotchas。
 
-**定稿方案（2026-11-25 更新）：V2 server 插件 `~/.config/opencode/plugins/watchdog.js` v11**——`export default { id, setup }`；**按 location 归属**；每轮 sweep 用 `/api/session/active` 刷新运行中会话。**核心边界：根会话由人负责，看门狗只监督子会话；不 ping/不空转提醒/不漂移告警/不打断根会话**（人可能正在阅读、思考或等用户，根会话不能因“没写”被吵醒）。5 分钟 sweep：
-- **子会话空转 10min → 通知父会话**：近 10 分钟有 ≥2 个 assistant 回合、但**没有任何写操作**（write/edit/patch，或写类 shell；纯读取/确认不算），冷却 20 分钟
-- **子会话 idle ≥60min → 通知父会话；≥4h → 打断子会话并告知父会话**（会话级归属，不跨会话、不做全局 worker 规则）
-- **根会话只记一条低频日志**（`root idle, no action`，每小时一次），**绝不唤醒或打断**
-- v3 的 L1/L2/L3/L4（静默 nudge、循环告警、漂移告警、stale 打断/自动复活）实现保留但**对根会话全部停用**；子会话走上述专用规则。如需恢复根会话监督必须显式修改策略，不能悄悄回流
-- **长工具保护**：子会话最新 assistant 回合仍有未完成工具（go build/protoc/test）⇒ 不打断；`session.tool.progress` 续命
-- **通知投递**：目标 running → steer；**idle → `opencode run -s <id> --continue --auto "<文本>"` 主动唤醒**（否则 prompt 只进 inbox），每会话上限 6 次；去重持久化在 `watchdog/notify-state.json`（7 天清理）
-- **救援口诀**：需要人工救会话时仍用 interrupt + `opencode run -s <id> --continue`；`tools/revive_session.js`
-生态复核（2026-11-25）：**没有可直接替换 v11 的同款插件**。最接近的 `Mte90/opencode-auto-resume`（V1/V2，GPL-3.0）会自动恢复根会话，与本插件「根会话由人负责」冲突，**禁止并存**；`joeyism/opencode-keepalive`（MIT）最轻，可借鉴按工具 stall budget/bash 分类，但 V2 options 示例需实测；`hueyexe/opencode-ensemble`（MIT）是完整团队编排，可借鉴 token/step 进度与通知去重；`Dqz00116/opencode-agents-monitor`（MIT，V2 beta）只做 TUI 观察；`mohak34/opencode-notifier`（MIT）只做桌面通知；`ByBrawe/opencode-loop`（MIT）只做 idle 调度。完整对比与优化 backlog 见备份仓 `README.md`「同类插件与优化候选」。
+**定稿方案（2026-11-25 更新）：V2 server 插件 `~/.config/opencode/plugins/watchdog.js` v12**——`export default { id, setup }`；**按 location 归属**；每轮 sweep 用 `/api/session/active` 刷新运行中会话。**核心边界：根会话由人负责，看门狗只监督子会话；不 ping/不空转提醒/不漂移告警/不打断根会话**（人可能正在阅读、思考或等用户，根会话不能因“没写”被吵醒）。
+- **V2.4 兼容**：事件从 `event.data` 解析（兼容旧 `properties`）；消息同时识别 `agent`/`assistant`。升级后必须跑 `bash tools/check-watchdog-policy.sh`，否则空转检测可能静默失效
+- **子会话终态异常 → 通知父会话**：provider error（429/401/timeout/network 分类）或成功但无最终文本/工具结果；成功终态延迟 3s 等消息落定
+- **子会话空转 10min → 通知父会话**：近 10 分钟有 ≥2 个 assistant/agent 回合、但没有任何写操作，冷却 20 分钟
+- **工具 stall budget**：quick 2min、build/test/unknown 30min、subagent 60min；超时通知父会话
+- **子会话 idle ≥60min → 通知父会话；≥4h 且没有预算内工具 → 打断并告知父会话**
+- **根会话只记低频日志**（`root idle, no action`，每小时一次），**绝不唤醒或打断**
+- **通知合并**：同一父会话 2 秒内多条报警合成一条；running→steer，idle→`opencode run --continue` 真唤醒；wake 上限 6 次，真实用户新回合重置
+- **脱敏**：标题/工具名/错误类别写日志或发 prompt 前清理控制字符、截断、掩码密钥
+- v3 的 L1/L2/L3/L4 实现保留但**对根会话全部停用**；子会话走上述专用规则。恢复根会话监督必须显式改策略
+- **门禁**：`bash tools/check-watchdog-policy.sh`（7 规则 + 4 集成测试）；`bash tools/mutation-self-test.sh`（4 变异必须红）
+- **救援口诀**：人工救会话仍用 interrupt + `opencode run -s <id> --continue`；`tools/revive_session.js`
+生态复核（2026-11-25）：**没有可直接替换 v12 的同款插件**。最接近的 `Mte90/opencode-auto-resume`（V1/V2，GPL-3.0）会自动恢复根会话，与本插件「根会话由人负责」冲突，**禁止并存**；`joeyism/opencode-keepalive`（MIT）最轻，可借鉴按工具 stall budget/bash 分类，但 V2 options 示例需实测；`hueyexe/opencode-ensemble`（MIT）是完整团队编排，可借鉴 token/step 进度与通知去重；`Dqz00116/opencode-agents-monitor`（MIT，V2 beta）只做 TUI 观察；`mohak34/opencode-notifier`（MIT）只做桌面通知；`ByBrawe/opencode-loop`（MIT）只做 idle 调度。完整对比与优化 backlog 见备份仓 `README.md`「同类插件与优化候选」。
 
 ## 2. 派工：直通优先
 

@@ -7,14 +7,14 @@
 // Per-location ownership: each location's instance watches ONLY sessions
 // under its own directory — one session corresponds to its own watchdog.
 //
+// v11 (2026-11-25): ROOT sessions are human-supervised. The watchdog never
+// nudges, drift-warns or interrupts a root; it only supervises children:
+//   10 min spin  -> notify that child's parent
+//   60 min idle  -> notify that child's parent
+//   4 h idle     -> interrupt that child + notify its parent
+// The v3 root-supervision helpers below are retained but intentionally disabled.
+//
 // Layers (all logged to ~/.local/state/opencode/watchdog/plugin.log):
-//   L1 nudge     : 15 min silent while running -> one steer ping per run
-//   L2 loop      : same tool input hash x3 in a row -> one steer warning
-//   L3 drift     : long run + every 60 min -> flash judge vs. session goal;
-//                  warning steer + log only, NEVER interrupts
-//   L4 interrupt : 30 min silent (bmall 90 min) -> auto interrupt
-// Gates: permission-pending sessions are skipped (waiting on a human, not
-// stuck). session.tool.progress keeps long single tool calls alive.
 const EVERY_MS = 5 * 60 * 1000
 const DEFAULT_STALE_MS = 30 * 60 * 1000
 const STALE_OVERRIDES = { "e:/work/bmall": 90 * 60 * 1000 }
@@ -283,6 +283,7 @@ export default {
     const staleMs = STALE_OVERRIDES[myDir] || DEFAULT_STALE_MS
     // sessionID -> { lastSeen, startedAt, nudged, loopWarned, lastDriftAt }
     const running = new Map()
+    const parentIDs = new Map() // sessionID -> parentID; roots are absent/empty
     const pendingPermission = new Map() // sessionID -> askedAt
     const toolHistory = new Map() // sessionID -> [inputHash,...]
     const reviveCount = new Map() // sessionID -> auto-revives this run window
@@ -503,6 +504,9 @@ export default {
           if (!id) continue
 
           if (event.type === "session.execution.started") {
+            const parentID = p.info && p.info.parentID
+            if (parentID) parentIDs.set(id, parentID)
+            else parentIDs.delete(id)
             running.set(id, {
               lastSeen: Date.now(),
               startedAt: Date.now(),
@@ -532,7 +536,10 @@ export default {
             if (!e0) continue
             e0.lastSeen = Date.now()
             e0.warned = false
-            // L2 loop detection: 3 identical tool inputs in a row
+            // v11 loop detection: only CHILD sessions are auto-supervised.
+            // Report the child's loop to its parent; never ping a root session
+            // for doing the same read three times (a lead often does exactly
+            // that while coordinating).
             try {
               const h = JSON.stringify(d.input || {})
               const hist = toolHistory.get(id) || []
@@ -540,17 +547,21 @@ export default {
               if (hist.length > 6) hist.shift()
               toolHistory.set(id, hist)
               const n = hist.length
+              const parentID = parentIDs.get(id)
               if (
+                parentID &&
                 n >= 3 &&
                 hist[n - 1] === hist[n - 2] &&
                 hist[n - 2] === hist[n - 3] &&
                 !e0.loopWarned
               ) {
                 e0.loopWarned = true
-                log("loop detected:", id)
+                log("child loop -> notify parent:", id)
                 send(
-                  id,
-                  "[watchdog] 检测到你连续 3 次以相同参数调用同一工具——疑似陷入循环。请停下重试，换一种策略，或说明卡点后收尾。"
+                  parentID,
+                  "[watchdog] 你派发的子会话「" +
+                    ((p.info && p.info.title) || id) +
+                    "」连续 3 次以相同参数调用同一工具，疑似陷入循环。请检查它是否需要换策略或中断重派。"
                 )
               }
             } catch {}
@@ -622,13 +633,15 @@ export default {
         const out = await gen({ model, prompt })
         const text = (out && (out.text || out.answer)) || ""
         log("drift result:", id, String(text).replace(/\s+/g, " ").slice(0, 200))
-        if (/"drift"\s*:\s*true/.test(String(text))) {
+        if (s.parentID && /"drift"\s*:\s*true/.test(String(text))) {
           const reason = (String(text).match(/"reason"\s*:\s*"([^"]*)"/) || [])[1] || "方向偏移"
           send(
-            id,
-            "[watchdog] 偏航预警：最近的工作疑似偏离原始目标（" +
+            s.parentID,
+            "[watchdog] 你派发的子会话「" +
+              ((s && s.title) || id) +
+              "」最近的工作疑似偏离原始目标（" +
               reason +
-              "）。请核对任务目标；若确认偏航，回到主线或向用户确认。"
+              "）。请核对它的任务目标；必要时纠偏或重派。"
           )
         }
       } catch (e) {
@@ -692,13 +705,10 @@ export default {
             continue
           }
           if (!owns(myDir, s.location && s.location.directory)) continue
+          if (s.parentID) parentIDs.set(id, s.parentID)
+          else parentIDs.delete(id)
           infos.set(id, s)
         }
-        const busyParents = new Set()
-        for (const [cid, cs] of infos) {
-          if (cs.parentID && infos.has(cs.parentID)) busyParents.add(cs.parentID)
-        }
-
         // pass 2: per-session decisions
         for (const [id, e] of [...running.entries()]) {
           const s = infos.get(id)
@@ -712,40 +722,32 @@ export default {
           const idleMin = last ? Math.round((now - last) / 60000) : -1
           e.recent = recent
 
-          // v9 spin: turns keep landing but nothing productive (no write/edit/
-          // patch, no non-read shell) for SPIN_MS -> notify. Child: tell its
-          // parent; root: nudges itself. Cooldown prevents spam.
-          let spinFired = false
+          // v11 spin: turns keep landing but nothing productive (no write/edit/
+          // patch, no non-read shell) for SPIN_MS -> notify the PARENT only.
+          // Root sessions are never nudged for spin: a lead legitimately spends
+          // time reading, waiting on children, or waiting for the human, and
+          // telling it "you haven't written anything" is just noise. Cooldown
+          // prevents spam.
           const spin =
+            !!s.parentID &&
             recent &&
             recent.turnsInWindow >= 2 &&
             now - (recent.lastProductive || 0) >= SPIN_MS &&
             now - e.startedAt >= SPIN_MS
           if (spin && !notifiedRecently(id, "spin", SPIN_COOLDOWN_MS)) {
             markNotified(id, "spin")
-            spinFired = true
             const spinMin = Math.round(
               (now - (recent.lastProductive || now - SPIN_MS)) / 60000
             )
-            if (s.parentID) {
-              log("spin -> notify parent:", id, spinMin + "m without writes")
-              send(
-                s.parentID,
-                "[watchdog] 你派发的子会话「" +
-                  ((s && s.title) || id) +
-                  "」已 " +
-                  spinMin +
-                  " 分钟只有读取/确认、没有任何写操作（空转）。请检查它是否在反复核对；必要时给硬指令或中断重派。"
-              )
-            } else {
-              log("spin -> nudge self:", id, spinMin + "m without writes")
-              send(
-                id,
-                "[watchdog] 你已 " +
-                  spinMin +
-                  " 分钟没有落地任何写操作（只有读取/确认）。停止继续考古，立即按工单落代码；若确认无需改动请直接汇报结论。"
-              )
-            }
+            log("spin -> notify parent:", id, spinMin + "m without writes")
+            send(
+              s.parentID,
+              "[watchdog] 你派发的子会话「" +
+                ((s && s.title) || id) +
+                "」已 " +
+                spinMin +
+                " 分钟只有读取/确认、没有任何写操作（空转）。请检查它是否在反复核对；必要时给硬指令或中断重派。"
+            )
           }
 
           // child sessions: session-level ownership — a lead supervises only
@@ -797,95 +799,16 @@ export default {
             continue
           }
 
-          // busy parent = waiting on running subagents: courtesy nudge at 2x
-          // window, never interrupt
-          if (busyParents.has(id)) {
-            if (!notifiedRecently(id, "busy", NUDGE_MS * 2) && idleMin >= (NUDGE_MS * 2) / 60000) {
-              markNotified(id, "busy")
-              log("busy-parent nudge:", id, idleMin + "m")
-              send(
-                id,
-                "[watchdog ping] 你的子任务仍在运行；若在等待请忽略；若子任务已卡死，请介入处理。"
-              )
-            }
-            continue
+          // v11: only CHILD sessions are auto-supervised (handled above). A
+          // root session is driven by the human: it may legitimately sit idle
+          // while the human reads, thinks, or waits on other work. Never nudge,
+          // drift-check, warn at, or interrupt a root — a ping here wakes an
+          // idle session for nothing and only produces noise.
+          if (idleMin >= NUDGE_MS / 60000 && !notifiedRecently(id, "rootidle", 60 * 60 * 1000)) {
+            markNotified(id, "rootidle")
+            log("root idle, no action:", id, idleMin + "m")
           }
-
-          // gate: waiting on a human permission card — not stuck
-          const askedAt = pendingPermission.get(id)
-          if (askedAt && now - askedAt < 2 * 60 * 60 * 1000) {
-            log("skip (permission pending):", id, idleMin + "m")
-            continue
-          }
-
-          // gate: an ACTIVE goal session is driven by the native goal engine
-          // (idle-hook continuation + reviewer) — hands off entirely.
-          if (
-            idleMin >= NUDGE_MS / 60000 ||
-            (e.startedAt && now - e.startedAt >= DRIFT_MIN_RUN_MS)
-          ) {
-            if (await goalActive(id)) {
-              log("goal-active, skip:", id, idleMin + "m")
-              continue
-            }
-          }
-
-          // L3 drift (long runs only, only when not actively producing, every
-          // 60 min, warn-only)
-          if (
-            e.startedAt &&
-            idleMin >= 10 &&
-            now - e.startedAt >= DRIFT_MIN_RUN_MS &&
-            now - (e.lastDriftAt || 0) >= DRIFT_EVERY_MS
-          ) {
-            void driftCheck(id, e, s)
-          }
-
-          // L1 nudge: silent 15 min but not yet stale — one ping per run
-          if (
-            idleMin >= NUDGE_MS / 60000 &&
-            idleMin < staleMs / 60000 &&
-            !spinFired &&
-            !notifiedRecently(id, "nudge", NUDGE_MS * 2)
-          ) {
-            markNotified(id, "nudge")
-            log("nudge:", id, idleMin + "m")
-            send(
-              id,
-              "[watchdog ping] 你已 " +
-                idleMin +
-                " 分钟无活动。若仍在推进请忽略本条；若卡住请换策略；若已完成请汇报结果。"
-            )
-          }
-
-          // L4 interrupt with pre-kill warning (ping-before-kill): the first
-          // time past the threshold only warns; interrupt on the NEXT sweep if
-          // the session is still silent — protects long tools/长回合.
-          if (idleMin >= staleMs / 60000) {
-            if (!e.warned) {
-              e.warned = true
-              log("pre-kill warning:", id, "idle", idleMin + "m", (s && s.title) || "")
-              send(
-                id,
-                "[watchdog] 你已 " +
-                  idleMin +
-                  " 分钟无活动；若下一轮巡检前仍无进展将被自动打断并复苏。若在长任务中请继续。"
-              )
-              continue
-            }
-            log("stale, interrupting:", id, "idle", idleMin + "m", (s && s.title) || "")
-            if (await fetchRunningTool(id)) {
-              log("skip interrupt (tool running):", id, idleMin + "m")
-              continue
-            }
-            try {
-              await ctx.session.interrupt({ sessionID: id, resume: false })
-            } catch (err) {
-              log("interrupt failed:", id, String(err))
-            }
-            autoRevive(id, staleMs / 60000)
-            void postMortem(id)
-          }
+          continue
         }
         log("sweep done:", myDir || "(no dir)", "running =", running.size)
       } catch (e) {

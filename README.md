@@ -16,16 +16,17 @@ skill/tools/                运维脚本
   resume_runner.js          续跑器（被 ps1/sh 复用）
 ```
 
-## 看门狗设计（plugin/watchdog.js）
+## 看门狗设计（plugin/watchdog.js，v11）
 
-- **按 location 归属**：每个位置的实例只看门自己目录下的会话，互不干扰
-- **5 分钟 sweep 分层**：
-  - 15min 静默 → nudge（steer 一条 ping，每 run 一次）
-  - 同工具同参数 ×3 → 循环告警
-  - 长跑 ≥30min、每 60min → 漂移判定（flash 档模型，只告警不打断）
-  - 30min 静默 → interrupt（可按目录覆写阈值）+ **自动复活**（`opencode run --continue`，上限 2 次/run）
-- **门控**：worker 子会话豁免（归主会话管）；权限卡片等待跳过；长工具调用由 `session.tool.progress` 续命；有运行中子代理的主会话视为 busy
-- **自愈**：打断前落现场（post-mortem），打断后驱动会话自行汇报
+- **根会话由人负责**：不 ping、不空转提醒、不漂移告警、不打断、不自动复活；只写低频 `root idle, no action` 日志（每小时一次）
+- **只监督子会话（会话级归属）**：通知永远发给子会话自己的父会话，不跨会话：
+  - 10min 有回合但无写操作 → 通知父会话（空转，冷却 20min）
+  - 同工具同参数 ×3 → 通知父会话（子会话疑似循环）
+  - idle ≥60min → 通知父会话
+  - idle ≥4h → 打断该子会话并通知父会话（最新回合有未完成工具时不打断）
+- **5 分钟 sweep**：按 location 只看自己目录下的会话；`session.tool.progress` 续命
+- **通知投递**：目标 running → steer；目标 idle → `opencode run --continue` 真唤醒（上限 6 次/会话）
+- **去重**：`watchdog/notify-state.json` 跨热重载去重，7 天自动清理
 - 日志：`~/.local/state/opencode/watchdog/plugin.log`
 
 ## 安装

@@ -27,6 +27,7 @@ skill/tools/                运维脚本
 - **5 分钟 sweep**：按 location 只看自己目录下的会话；`session.tool.progress` 续命
 - **通知投递**：目标 running → steer；目标 idle → `opencode run --continue` 真唤醒（上限 6 次/会话）
 - **去重**：`watchdog/notify-state.json` 跨热重载去重，7 天自动清理
+- **策略门禁**：`bash tools/check-watchdog-policy.sh`（断言所有 `send()` 只能发给父会话；带变异自检，根会话监督回流必红）
 - 日志：`~/.local/state/opencode/watchdog/plugin.log`
 
 ## 安装
